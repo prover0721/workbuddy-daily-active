@@ -26,7 +26,7 @@ const LOG_FILE = resolve(__dirname, 'daily-active.log');
 const STATE_FILE = resolve(__dirname, 'active-state.json');
 const BASE_URL = 'https://www.workbuddy.ai';
 
-// 默认兜底 0 消耗免费模型池 (优先从本地目录动态校验)
+// 默认兜底 0 消耗免费模型池 (官方目录认证：billing: x0.00 / free: true)
 const DEFAULT_FREE_MODELS = [
   'deepseek-v4.1-flash',
   'hy3',
@@ -41,47 +41,43 @@ function getFreeModels() {
     if (existsSync(CATALOG_FILE)) {
       const raw = readFileSync(CATALOG_FILE, 'utf-8');
       const catalog = JSON.parse(raw);
-      const items = catalog.items || (Array.isArray(catalog) ? catalog : []);
       const detected = [];
-      for (const item of items) {
-        const id = item.id || item.model_id || item.name;
-        const billing = item.billing ?? item.billing_rate ?? item.rate;
-        const isFree = item.free === true || billing === 0 || billing === '0' || billing === '0.00';
-        if (id && isFree && !detected.includes(id)) {
-          detected.push(id);
+      for (const entry of Object.values(catalog.entries || {})) {
+        for (const m of (entry.models || [])) {
+          const isFree = m.billing?.free === true || m.billing?.credits === 'x0.00' || m.billing?.rate === 0;
+          if (isFree && m.id && !detected.includes(m.id)) {
+            detected.push(m.id);
+          }
         }
       }
       if (detected.length > 0) {
         return detected;
       }
     }
-  } catch (err) {
-    // 降级使用内置认证模型
-  }
+  } catch (err) {}
   return DEFAULT_FREE_MODELS;
 }
 
 // 多样化提示词主题库，保证每天不同账号、不同日期的对话内容千变万化且自然真实
 const TOPIC_TEMPLATES = [
   // 编程与算法
-  () => `请用一句话解释计算机中的${['快速排序', '哈希表冲突处理', '二叉平衡树', '零拷贝技术', '并发死锁原理', 'TCP三次握手', '协程与线程区别', 'RESTful架构', 'LRU缓存淘汰算法', '分布式锁'][Math.floor(Math.random() * 10)]}。`,
-  // 系统与开发日常
-  () => `开发中遇到${['CPU占用突增', '内存泄漏', '网络偶发超时', '数据库慢查询', 'Git合并冲突', '前端首屏加载慢', 'DNS解析异常'][Math.floor(Math.random() * 7)]}时，最优先排查的步骤是什么？请极简回答。`,
-  // 前沿科普与百科
-  () => `请简要介绍物理或天文概念：${['量子纠缠', '黑洞事件视界', '詹姆斯韦伯望远镜', '引力透镜效应', '超导临界温度', '宇宙背景辐射'][Math.floor(Math.random() * 6)]}，不超过50字。`,
-  // 逻辑与生活常识
-  () => `请分享一条关于${['健康用眼', '番茄工作法', '时间管理', '高效阅读', '久坐放松拉伸', '深度睡眠改善'][Math.floor(Math.random() * 6)]}的实用小建议。`,
-  // 数学与思维
-  () => `计算一道简答题：${['15乘以16等于多少？', '2的10次方是多少？', '什么是费马大定理？', '质数有什么数学特性？'][Math.floor(Math.random() * 4)]}给出答案即可。`
+  () => `请用一句话解释计算机中的${['快速排序', '哈希表冲突处理', '二叉平衡树', '零拷贝技术', '并发死锁原理', 'TCP三次握手', '协程与线程区别', 'RESTful架构', 'LRU缓存算法'][Math.floor(Math.random() * 9)]}。`,
+  () => `在 ${['Python', 'JavaScript', 'Go', 'Rust', 'TypeScript', 'C++'][Math.floor(Math.random() * 6)]} 中，如何优雅地处理${['异步异常', '深拷贝对象', '列表扁平化', '字符串格式化', '多线程安全', '时间戳转换'][Math.floor(Math.random() * 6)]}？请给出一行核心代码。`,
+  // 科学与生活
+  () => `简述${['量子纠缠', '光合作用原理', '黑洞事件视界', 'DNA双螺旋结构', '温室效应', '板块构造学说', '开普勒行星定律'][Math.floor(Math.random() * 7)]}的核心概念（30字以内）。`,
+  () => `推荐${['一本经典科幻小说', '一本关于心理学的入门书籍', '一个提高专注力的番茄工作法技巧', '一个程序员日常护眼小贴士', '一种简单的有氧拉伸方法'][Math.floor(Math.random() * 5)]}并简要说明理由。`,
+  // 幽默与日常思考
+  () => `请分享一个${['关于程序员幽默调侃', '关于人工智能发展的哲理思考', '简短且温暖人心的早安祝福', '适合今天开启高效工作的励志短句'][Math.floor(Math.random() * 4)]}。`,
+  () => `请列举三种${['世界上最深的海沟', '历史上有名的天文学家', '最抗逆境的植物', '开源社区著名的协议（如MIT）'][Math.floor(Math.random() * 4)]}并附带一句话介绍。`
 ];
 
 function log(msg) {
-  const ts = new Date().toLocaleString('zh-CN', { hour12: false });
-  const line = `[${ts}] ${msg}`;
+  const time = new Date().toLocaleString('zh-CN', { hour12: false });
+  const line = `[${time}] ${msg}`;
   console.log(line);
   try {
     appendFileSync(LOG_FILE, line + '\n', 'utf-8');
-  } catch (e) {}
+  } catch {}
 }
 
 function loadState() {
@@ -89,314 +85,305 @@ function loadState() {
     if (existsSync(STATE_FILE)) {
       return JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
     }
-  } catch (e) {}
-  return { history: {} };
+  } catch {}
+  return { lastRunDate: '', modelIndex: 0, accountHistory: {} };
 }
 
 function saveState(state) {
   try {
     writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
-  } catch (e) {}
+  } catch (e) {
+    log(`保存运行状态失败: ${e.message}`);
+  }
+}
+
+// 自动刷新 Token
+async function refreshTokenIfNeeded(vaultFile, data) {
+  const exp = data.auth?.expiresAt;
+  const nowSec = Math.floor(Date.now() / 1000);
+  // 如果还有超过 24 小时有效期，不需要刷新
+  if (exp && exp - nowSec > 86400) {
+    return data.auth.accessToken;
+  }
+
+  const refreshToken = data.auth?.refreshToken;
+  if (!refreshToken) {
+    return data.auth?.accessToken;
+  }
+
+  log(`账号 [${data.account?.nickname || data.account?.email}] Token 即将到期或未记录到期时间，尝试续期...`);
+  try {
+    const res = await fetch(`${BASE_URL}/v2/plugin/auth/token/refresh`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${data.auth.accessToken}`,
+        'X-Refresh-Token': refreshToken,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'User-Agent': 'WorkBuddyAI/5.8.4'
+      },
+      body: '{}'
+    });
+
+    if (res.status === 200) {
+      const json = await res.json();
+      if (json.code === 0 && json.data?.accessToken) {
+        data.auth.accessToken = json.data.accessToken;
+        if (json.data.refreshToken) data.auth.refreshToken = json.data.refreshToken;
+        if (json.data.expiresAt) data.auth.expiresAt = json.data.expiresAt;
+        writeFileSync(vaultFile, JSON.stringify(data, null, 2), 'utf-8');
+        log(`账号 [${data.account?.nickname}] Token 续期并回写成功！`);
+        return data.auth.accessToken;
+      }
+    }
+    log(`Token 续期响应非预期 (HTTP ${res.status})，继续使用现有 accessToken。`);
+  } catch (err) {
+    log(`Token 续期请求异常: ${err.message}，继续使用现有 accessToken。`);
+  }
+  return data.auth.accessToken;
 }
 
 // 查询账号当前精确积分余额 (CycleCapacityRemainPrecise)
 async function fetchPreciseBalance(accountInfo) {
   try {
     const now = new Date();
-    const dateStr = now.toISOString().slice(0, 10);
-    const url = `${BASE_URL}/v2/plugin/user/capacity-package-remain-amount?date=${dateStr}&timeUnit=day`;
-    const resp = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'Accept': 'application/json, text/plain, */*',
-        'Authorization': `Bearer ${accountInfo.accessToken}`,
-        'Origin': BASE_URL,
-        'Referer': `${BASE_URL}/`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
+    const pad = n => String(n).padStart(2, '0');
+    const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const begin = fmt(now);
+    const end = fmt(new Date(now.getTime() + 3686 * 86400000));
 
-    if (!resp.ok) return null;
-    const body = await resp.json();
-    const data = body.data || body;
-    const packages = data.UserCapacityPackageList || data.packages || [];
-    
-    let totalPrecise = 0;
-    for (const pkg of packages) {
-      if (pkg.CycleCapacityRemainPrecise !== undefined && pkg.CycleCapacityRemainPrecise !== null) {
-        totalPrecise += parseFloat(pkg.CycleCapacityRemainPrecise) || 0;
-      } else if (pkg.CycleCapacityRemain !== undefined) {
-        totalPrecise += parseFloat(pkg.CycleCapacityRemain) || 0;
-      }
-    }
-    return totalPrecise.toFixed(2);
-  } catch (err) {
-    return null;
-  }
-}
+    const body = {
+      PageNumber: 1,
+      PageSize: 100,
+      ProductCode: 'p_tcaca',
+      Status: [0, 3],
+      PackageEndTimeRangeBegin: begin,
+      PackageEndTimeRangeEnd: end
+    };
 
-// 读取凭据保险库中所有有效账号，按 uid 去重
-function loadDistinctAccounts() {
-  if (!existsSync(VAULT_DIR)) {
-    throw new Error(`找不到凭据保险库目录: ${VAULT_DIR}`);
-  }
-
-  const files = readdirSync(VAULT_DIR).filter(f => f.endsWith('.json'));
-  const accountsByUid = new Map();
-
-  for (const file of files) {
-    const filePath = resolve(VAULT_DIR, file);
-    try {
-      const content = JSON.parse(readFileSync(filePath, 'utf-8'));
-      if (content && content.accessToken) {
-        const uid = content.uid || content.email || file;
-        // 如果该 uid 尚未记录，或当前文件包含更新的凭据，则采用
-        if (!accountsByUid.has(uid) || (content.updatedAt && content.updatedAt > (accountsByUid.get(uid).raw.updatedAt || 0))) {
-          accountsByUid.set(uid, {
-            filePath,
-            fileName: file,
-            uid,
-            email: content.email || content.username || 'unknown',
-            accessToken: content.accessToken,
-            refreshToken: content.refreshToken,
-            expiresAt: content.expiresAt || 0,
-            raw: content
-          });
-        }
-      }
-    } catch (err) {
-      log(`[警告] 读取凭据文件 ${file} 失败: ${err.message}`);
-    }
-  }
-
-  return Array.from(accountsByUid.values());
-}
-
-// 检查并在需要时自动刷新 Token
-async function ensureValidToken(account) {
-  const now = Date.now();
-  // 提前 5 分钟判断过期
-  if (account.expiresAt && account.expiresAt - now > 5 * 60 * 1000) {
-    return account.accessToken;
-  }
-
-  if (!account.refreshToken) {
-    log(`[${account.email}] 无 refreshToken，继续使用现有 accessToken 尝试`);
-    return account.accessToken;
-  }
-
-  log(`[${account.email}] Token 即将过期或已失效，正在刷新...`);
-  try {
-    const resp = await fetch(`${BASE_URL}/v2/plugin/auth/token/refresh`, {
+    const res = await fetch(`${BASE_URL}/v2/billing/meter/get-user-resource`, {
       method: 'POST',
       headers: {
+        'Authorization': `Bearer ${accountInfo.accessToken}`,
         'Content-Type': 'application/json',
-        'User-Agent': 'WorkBuddyAI/5.8.4',
-        'Origin': BASE_URL,
-        'Referer': `${BASE_URL}/`
-      },
-      body: JSON.stringify({ refresh_token: account.refreshToken })
-    });
-
-    if (!resp.ok) {
-      throw new Error(`刷新失败 HTTP ${resp.status}`);
-    }
-
-    const resJson = await resp.json();
-    const data = resJson.data || resJson;
-    if (data.access_token) {
-      account.accessToken = data.access_token;
-      if (data.refresh_token) account.refreshToken = data.refresh_token;
-      if (data.expires_in) account.expiresAt = now + data.expires_in * 1000;
-
-      // 回写凭据保险库
-      account.raw.accessToken = account.accessToken;
-      account.raw.refreshToken = account.refreshToken;
-      account.raw.expiresAt = account.expiresAt;
-      account.raw.updatedAt = now;
-      writeFileSync(account.filePath, JSON.stringify(account.raw, null, 2), 'utf-8');
-      log(`[${account.email}] Token 刷新成功并已更新本地凭据库`);
-      return account.accessToken;
-    }
-  } catch (err) {
-    log(`[${account.email}] 刷新 Token 异常: ${err.message}`);
-  }
-
-  return account.accessToken;
-}
-
-// 获取当天的热力图与活跃状态
-async function fetchUserActivity(token) {
-  try {
-    const resp = await fetch(`${BASE_URL}/v2/plugin/user/heatmap`, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/json, text/plain, */*',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-User-Id': accountInfo.uid,
         'User-Agent': 'WorkBuddyAI/5.8.4'
-      }
+      },
+      body: JSON.stringify(body)
     });
-    if (resp.ok) {
-      const data = await resp.json();
-      const points = data.data?.points || data.points || [];
-      const todayStr = new Date().toISOString().slice(0, 10);
-      const todayPoint = points.find(p => p.date === todayStr);
-      return todayPoint ? todayPoint.score : 0;
+
+    if (res.status === 200) {
+      const json = await res.json();
+      const accs = json?.data?.Response?.Data?.Accounts || [];
+      let total = 0;
+      for (const a of accs) {
+        total += parseFloat(a.CycleCapacityRemainPrecise ?? a.CycleCapacityRemain) || 0;
+      }
+      return (Math.round(total * 100) / 100).toFixed(2);
     }
-  } catch (e) {}
+  } catch {}
   return null;
 }
 
-// 发起一次合法、低消耗/0消耗的真实对话以触发活跃
-async function triggerDailyConversation(account, freeModels, retryCount = 0) {
-  const token = await ensureValidToken(account);
-  // 轮换选择免费模型 (若重试则换下一个)
-  const modelIndex = (retryCount) % freeModels.length;
-  const selectedModel = freeModels[modelIndex];
-
-  // 动态生成不重复问答提示
-  const randomPromptGen = TOPIC_TEMPLATES[Math.floor(Math.random() * TOPIC_TEMPLATES.length)];
-  const prompt = randomPromptGen();
-
-  const conversationId = crypto.randomUUID();
-  const requestId = crypto.randomUUID();
-
-  log(`[${account.email}] 发起保活对话 -> 模型: [${selectedModel}], 问题: "${prompt}"`);
-
-  const payload = {
-    conversation_id: conversationId,
-    messages: [
-      {
-        role: 'user',
-        content: prompt
+// 查询热力图活跃度积分
+async function fetchHeatmapScore(accountInfo) {
+  try {
+    const res = await fetch(`${BASE_URL}/v2/user/user-score-trend`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${accountInfo.accessToken}`,
+        'Accept': 'application/json, text/plain, */*',
+        'User-Agent': 'WorkBuddyAI/5.8.4'
       }
+    });
+    if (res.status === 200) {
+      const json = await res.json();
+      const points = json?.data?.points || [];
+      if (points.length > 0) {
+        const last = points[points.length - 1];
+        return last.score;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+// 发起真实合法对话 (带失败自动就地重试1次)
+async function sendDailyConversation(accountInfo, modelName, questionText, attempt = 1) {
+  const token = accountInfo.accessToken;
+  const payload = {
+    model: modelName,
+    messages: [
+      { role: 'system', content: 'You are a helpful and concise AI assistant.' },
+      { role: 'user', content: questionText }
     ],
-    model: selectedModel,
-    stream: true,
-    agent_id: 'default'
+    stream: true
   };
 
   const headers = {
-    'Content-Type': 'application/json',
     'Authorization': `Bearer ${token}`,
-    'X-Request-Id': requestId,
-    'X-Agent-Purpose': 'general',
+    'Content-Type': 'application/json',
+    'Accept': 'text/event-stream',
     'User-Agent': 'WorkBuddyAI/5.8.4',
-    'Origin': BASE_URL,
-    'Referer': `${BASE_URL}/`
+    'X-Conversation-ID': crypto.randomUUID(),
+    'X-Conversation-Request-ID': crypto.randomUUID(),
+    'X-Conversation-Message-ID': crypto.randomUUID(),
+    'X-Agent-Purpose': 'conversation'
   };
 
   const startTime = Date.now();
-  const resp = await fetch(`${BASE_URL}/v2/plugin/chat/chat-completion`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload)
-  });
-
-  if (!resp.ok) {
-    const errText = await resp.text();
-    if (retryCount < 1) {
-      log(`[${account.email}] 对话请求失败 (HTTP ${resp.status})，尝试更换备选模型重试...`);
-      return await triggerDailyConversation(account, freeModels, retryCount + 1);
-    }
-    throw new Error(`HTTP ${resp.status}: ${errText.slice(0, 200)}`);
-  }
-
-  // 读取前置数据流，一旦确认模型开始应答即可快速关闭流，避免长连接消耗
-  let receivedAnyToken = false;
-  let replySnippet = '';
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      if (chunk.includes('data:') || chunk.length > 5) {
-        receivedAnyToken = true;
-        replySnippet = chunk.slice(0, 100).replace(/\r?\n/g, ' ');
-        // 收到首个应答块，已坐实后端计入一次真实有效会话，安全断开
-        await reader.cancel();
-        break;
-      }
-    }
-  } catch (streamErr) {
-    // 忽略主动断开的取消异常
-  }
+    const res = await fetch(`${BASE_URL}/v2/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
 
-  const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-  log(`[${account.email}] 对话成功响应 (耗时: ${duration}s, 收到应答块: ${receivedAnyToken ? '是' : '否'})`);
-  return { success: true, model: selectedModel, prompt, duration };
+    const duration = Date.now() - startTime;
+    if (res.status === 200) {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let replySnippet = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) {
+          const chunk = decoder.decode(value);
+          replySnippet += chunk;
+          if (replySnippet.length > 200) {
+            reader.cancel();
+            break;
+          }
+        }
+      }
+      return { ok: true, duration };
+    } else {
+      const errorText = await res.text().catch(() => '');
+      if (attempt === 1) {
+        log(`[重试] 首选模型 ${modelName} 响应 HTTP ${res.status}，正在重试备选模型...`);
+        const fallbackModel = 'hy3';
+        return await sendDailyConversation(accountInfo, fallbackModel, questionText, attempt + 1);
+      }
+      return { ok: false, status: res.status, error: errorText, duration };
+    }
+  } catch (err) {
+    if (attempt === 1) {
+      log(`[重试] 请求异常 (${err.message})，正在重试...`);
+      return await sendDailyConversation(accountInfo, 'hy3', questionText, attempt + 1);
+    }
+    return { ok: false, status: -1, error: err.message, duration: Date.now() - startTime };
+  }
 }
 
+// 主流程
 async function main() {
   log('====================================================');
-  log(' WorkBuddy 多账号每日活跃打卡程序启动');
-  log('====================================================');
+  log(' 开始执行 WorkBuddy 每日多账号活跃与积分查询任务...');
 
-  const freeModels = getFreeModels();
-  log(`[模型探测] 当前 0 消耗/极低消耗候选池: ${freeModels.join(', ')}`);
-
-  const accounts = loadDistinctAccounts();
-  log(`[账号发现] 扫描到 ${accounts.length} 个独立 WorkBuddy 账号`);
-
-  const state = loadState();
-  const today = new Date().toISOString().slice(0, 10);
-  if (!state.history[today]) {
-    state.history[today] = {};
+  if (!existsSync(VAULT_DIR)) {
+    log(`错误：未找到凭据保险库路径 ${VAULT_DIR}`);
+    process.exit(1);
   }
 
+  const files = readdirSync(VAULT_DIR).filter(f => f.endsWith('.json'));
+  if (files.length === 0) {
+    log(`警告：保险库目录下没有任何账号凭据文件。`);
+    process.exit(0);
+  }
+
+  // 1. 读取并按 uid 聚合去重账号
+  const accountsMap = new Map();
+  for (const f of files) {
+    const fullPath = resolve(VAULT_DIR, f);
+    try {
+      const content = JSON.parse(readFileSync(fullPath, 'utf-8'));
+      const uid = content.account?.uid || content.auth?.sub;
+      if (!uid) continue;
+
+      if (!accountsMap.has(uid)) {
+        accountsMap.set(uid, {
+          uid,
+          nickname: content.account?.nickname || content.account?.email || content.accountId || uid.slice(0, 8),
+          filePath: fullPath,
+          raw: content
+        });
+      }
+    } catch (e) {
+      log(`解析账号文件 ${f} 失败: ${e.message}`);
+    }
+  }
+
+  const accounts = Array.from(accountsMap.values());
+  log(`已识别出 ${accounts.length} 个独立有效账号。`);
+
+  // 2. 动态加载 0 消耗免费模型候选池
+  const freeModels = getFreeModels();
+  const state = loadState();
+  const todayStr = new Date().toISOString().slice(0, 10);
+  
+  let currentModelIdx = state.modelIndex % freeModels.length;
+  const selectedModel = freeModels[currentModelIdx];
+  log(`今日选定轮换模型: [${selectedModel}] (0 积分免费模型)`);
+
+  // 3. 对每个独立账号执行对话与积分查询
+  let successCount = 0;
   for (let i = 0; i < accounts.length; i++) {
     const acc = accounts[i];
     log(`----------------------------------------------------`);
-    log(`正在处理账号 [${i + 1}/${accounts.length}]: ${acc.email} (UID: ${acc.uid})`);
+    log(`正在处理第 ${i + 1}/${accounts.length} 个账号: [${acc.nickname}] (UID: ${acc.uid.slice(0, 8)}...)`);
 
-    try {
-      // 1. 查询执行前的当前精确积分
-      const initialBalance = await fetchPreciseBalance(acc);
-      if (initialBalance !== null) {
-        log(`[${acc.email}] 当前积分余额: ${initialBalance}`);
-      }
+    // 检查并刷新 Token
+    const activeToken = await refreshTokenIfNeeded(acc.filePath, acc.raw);
+    acc.accessToken = activeToken;
 
-      // 2. 发起轻量对话触发今日活跃
-      const result = await triggerDailyConversation(acc, freeModels);
+    // 查询当前精确积分
+    const balanceBefore = await fetchPreciseBalance(acc);
+    if (balanceBefore !== null) {
+      log(`[${acc.nickname}] 当前积分余额: ${balanceBefore}`);
+    }
 
-      // 3. 查询执行后的活跃热力图与最新余额
-      await new Promise(r => setTimeout(r, 2000)); // 稍作等待以同步服务端统计
-      const finalScore = await fetchUserActivity(acc.accessToken);
-      const finalBalance = await fetchPreciseBalance(acc);
+    // 随机抽取完全不同的对话问题
+    const randomTopicGen = TOPIC_TEMPLATES[Math.floor(Math.random() * TOPIC_TEMPLATES.length)];
+    const question = randomTopicGen();
+    log(`发送自然对话: "${question}"`);
 
-      log(`[${acc.email}] 今日累计活跃热力分: ${finalScore !== null ? finalScore : '已提交'}`);
-      if (finalBalance !== null) {
-        log(`[${acc.email}] 结算后积分余额: ${finalBalance}`);
-      }
+    const result = await sendDailyConversation(acc, selectedModel, question);
+    if (result.ok) {
+      log(`✓ [${acc.nickname}] 对话成功！(耗时 ${result.duration}ms)，已成功在官方服务留下今日活跃记录！`);
+      successCount++;
+    } else {
+      log(`✗ [${acc.nickname}] 对话失败 HTTP ${result.status} (耗时 ${result.duration}ms): ${result.error?.slice(0, 180)}`);
+    }
 
-      state.history[today][acc.uid] = {
-        email: acc.email,
-        time: new Date().toISOString(),
-        model: result.model,
-        prompt: result.prompt,
-        heatmapScore: finalScore,
-        balance: finalBalance || initialBalance,
-        success: true
-      };
-    } catch (err) {
-      log(`[${acc.email}] 执行失败: ${err.message}`);
-      state.history[today][acc.uid] = {
-        email: acc.email,
-        time: new Date().toISOString(),
-        error: err.message,
-        success: false
-      };
+    // 稍作等待并查询最新活跃与积分
+    await new Promise(r => setTimeout(r, 2000));
+    const heatmapScore = await fetchHeatmapScore(acc);
+    if (heatmapScore !== null) {
+      log(`[${acc.nickname}] 今日累计活跃热力分: ${heatmapScore}`);
+    }
+    const balanceAfter = await fetchPreciseBalance(acc);
+    if (balanceAfter !== null) {
+      log(`[${acc.nickname}] 当前最新积分余额: ${balanceAfter}`);
+    }
+
+    if (i < accounts.length - 1) {
+      await new Promise(r => setTimeout(r, 2000));
     }
   }
 
+  // 4. 更新状态与轮换指针
+  state.lastRunDate = todayStr;
+  state.modelIndex = (currentModelIdx + 1) % freeModels.length;
   saveState(state);
-  log('====================================================');
-  log(' 全部账号活跃打卡与积分查询任务已完成');
-  log('====================================================');
+
+  log('----------------------------------------------------');
+  log(`每日活跃任务执行完成！成功: ${successCount} / ${accounts.length}。明天将轮换模型: ${freeModels[state.modelIndex]}`);
+  log('====================================================\n');
 }
 
 main().catch(err => {
-  log(`[致命错误] ${err.stack || err.message}`);
+  log(`程序未捕获异常: ${err.stack || err.message}`);
   process.exit(1);
 });
