@@ -1,0 +1,18 @@
+# Runtime State & Logs
+*.log
+daily-active.log
+active-state.json
+*-state.json
+
+# Local Environment & Secrets
+.env
+.env.local
+.dsh/
+*.token
+*.pem
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
