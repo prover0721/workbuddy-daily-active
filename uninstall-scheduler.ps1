@@ -1,4 +1,4 @@
-# Windows 任务计划程序一键卸载脚本 (Unregister WorkBuddy Daily Active Scheduler)
+﻿# Windows 任务计划程序一键卸载脚本 (Unregister WorkBuddy Daily Active Scheduler)
 $ErrorActionPreference = 'SilentlyContinue'
 $TaskName = "WorkBuddyDailyActive"
 

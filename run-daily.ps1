@@ -1,4 +1,4 @@
-# PowerShell Execution Wrapper (WorkBuddy Daily Active & Balance Checker)
+﻿# PowerShell Execution Wrapper (WorkBuddy Daily Active & Balance Checker)
 $ErrorActionPreference = 'Continue'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 

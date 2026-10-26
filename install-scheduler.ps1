@@ -1,4 +1,4 @@
-# Windows 任务计划程序一键注册脚本 (Register WorkBuddy Daily Active Scheduler)
+﻿# Windows 任务计划程序一键注册脚本 (Register WorkBuddy Daily Active Scheduler)
 $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
