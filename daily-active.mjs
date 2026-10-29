@@ -29,8 +29,7 @@ const BASE_URL = 'https://www.workbuddy.ai';
 // 默认兜底 0 消耗免费模型池 (官方目录认证：billing: x0.00 / free: true)
 const DEFAULT_FREE_MODELS = [
   'deepseek-v4.1-flash',
-  'hy3',
-  'step-5-preview'
+  'hy3'
 ];
 
 /**
@@ -45,7 +44,7 @@ function getFreeModels() {
       for (const entry of Object.values(catalog.entries || {})) {
         for (const m of (entry.models || [])) {
           const isFree = m.billing?.free === true || m.billing?.credits === 'x0.00' || m.billing?.rate === 0;
-          if (isFree && m.id && !detected.includes(m.id)) {
+          if (isFree && m.id && m.id !== 'step-5-preview' && !detected.includes(m.id)) {
             detected.push(m.id);
           }
         }
@@ -190,29 +189,77 @@ async function fetchPreciseBalance(accountInfo) {
 // 查询热力图活跃度积分
 async function fetchHeatmapScore(accountInfo) {
   try {
-    const res = await fetch(`${BASE_URL}/v2/user/user-score-trend`, {
+    const res = await fetch(`${BASE_URL}/v2/activity/growth/heatmap`, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${accountInfo.accessToken}`,
+        'X-User-Id': accountInfo.uid,
         'Accept': 'application/json, text/plain, */*',
         'User-Agent': 'WorkBuddyAI/5.8.4'
       }
     });
     if (res.status === 200) {
       const json = await res.json();
-      const points = json?.data?.points || [];
-      if (points.length > 0) {
-        const last = points[points.length - 1];
-        return last.score;
-      }
+      const cells = json?.data?.cells || [];
+      const today = new Date().toISOString().slice(0, 10);
+      const cell = cells.find(c => c.date === today);
+      return cell ? cell.score : 0;
     }
   } catch {}
   return null;
 }
 
-// 发起真实合法对话 (带失败自动就地重试1次)
+// 上报客户端活跃事件 (触发官方每日 30 积分奖励结算判定)
+async function reportActivityEvent(accountInfo, modelName, conversationId) {
+  try {
+    const now = Date.now();
+    const body = [
+      {
+        eventCode: 'chat_request_send',
+        timestamp: now,
+        reportDelay: 1000,
+        mode: 'unknown',
+        conversationId: conversationId || crypto.randomUUID(),
+        requestId: crypto.randomBytes(8).toString('hex'),
+        inputLength: 100,
+        requestModelId: modelName,
+        requestModelName: modelName,
+        maxSteps: 500,
+        mentionContexts: [],
+        knowledgeId: [],
+        knowledgeName: [],
+        agentName: 'cli',
+        agentType: 'main',
+        timezone: 'Asia/Shanghai',
+        traceId: crypto.randomBytes(16).toString('hex'),
+        userId: accountInfo.uid,
+        username: accountInfo.nickname || accountInfo.email || accountInfo.uid,
+        userNickname: accountInfo.nickname || accountInfo.email || accountInfo.uid
+      }
+    ];
+
+    const res = await fetch(`${BASE_URL}/v2/report`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accountInfo.accessToken}`,
+        'X-User-Id': accountInfo.uid,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'User-Agent': 'WorkBuddyAI/5.8.4'
+      },
+      body: JSON.stringify(body)
+    });
+    return res.status === 200;
+  } catch (err) {
+    log(`[警告] 活跃事件上报异常: ${err.message}`);
+    return false;
+  }
+}
+
+// 发起真实合法对话与活跃上报 (带失败自动就地重试1次)
 async function sendDailyConversation(accountInfo, modelName, questionText, attempt = 1) {
   const token = accountInfo.accessToken;
+  const conversationId = crypto.randomUUID();
   const payload = {
     model: modelName,
     messages: [
@@ -227,7 +274,7 @@ async function sendDailyConversation(accountInfo, modelName, questionText, attem
     'Content-Type': 'application/json',
     'Accept': 'text/event-stream',
     'User-Agent': 'WorkBuddyAI/5.8.4',
-    'X-Conversation-ID': crypto.randomUUID(),
+    'X-Conversation-ID': conversationId,
     'X-Conversation-Request-ID': crypto.randomUUID(),
     'X-Conversation-Message-ID': crypto.randomUUID(),
     'X-Agent-Purpose': 'conversation'
@@ -258,6 +305,10 @@ async function sendDailyConversation(accountInfo, modelName, questionText, attem
           }
         }
       }
+
+      // 对话成功后，同步上报官方客户端埋点事件 (将活跃分即刻计入后台)
+      await reportActivityEvent(accountInfo, modelName, conversationId);
+
       return { ok: true, duration };
     } else {
       const errorText = await res.text().catch(() => '');
@@ -361,7 +412,8 @@ async function main() {
     await new Promise(r => setTimeout(r, 2000));
     const heatmapScore = await fetchHeatmapScore(acc);
     if (heatmapScore !== null) {
-      log(`[${acc.nickname}] 今日累计活跃热力分: ${heatmapScore}`);
+      const statusText = heatmapScore > 0 ? ' (今日活跃已点亮，明日清晨自动发放 +30 奖励包)' : ' (活跃分暂未同步)';
+      log(`[${acc.nickname}] 今日累计活跃热力分: ${heatmapScore}${statusText}`);
     }
     const balanceAfter = await fetchPreciseBalance(acc);
     if (balanceAfter !== null) {
