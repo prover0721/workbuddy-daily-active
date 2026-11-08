@@ -96,6 +96,242 @@ function saveState(state) {
   }
 }
 
+function clientToken(prefix = 'u') {
+  return prefix + crypto.randomBytes(16).toString('hex');
+}
+
+// 每日签到活动自适应（国内版开启时自动领取）
+async function tryDailyCheckin(accountInfo) {
+  try {
+    const res = await fetch(`${BASE_URL}/v2/billing/meter/checkin-activity-status`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accountInfo.accessToken}`,
+        'X-User-Id': accountInfo.uid,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'User-Agent': 'WorkBuddyAI/5.8.4'
+      },
+      body: '{}'
+    });
+    if (res.status === 200) {
+      const json = await res.json();
+      const d = json.data;
+      if (d && d.active) {
+        if (!d.today_checked_in) {
+          const claimRes = await fetch(`${BASE_URL}/v2/billing/meter/daily-checkin`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${accountInfo.accessToken}`,
+              'X-User-Id': accountInfo.uid,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+              'User-Agent': 'WorkBuddyAI/5.8.4'
+            },
+            body: '{}'
+          });
+          if (claimRes.status === 200) {
+            const claimJson = await claimRes.json();
+            const credit = claimJson.data?.credit || d.daily_credit || 100;
+            log(`  [签到] 成功领取今日签到积分 +${credit}！(连签 ${d.streak_days + 1} 天)`);
+            return;
+          }
+        } else {
+          log(`  [签到] 今日已签到 (连签 ${d.streak_days} 天)`);
+          return;
+        }
+      }
+    }
+  } catch (err) {}
+}
+
+// 成长中心自适应巡检与自动领奖 (礼物/任务/连登兑换/抽奖/补登)
+async function runGrowthCenter(accountInfo) {
+  const headers = {
+    'Authorization': `Bearer ${accountInfo.accessToken}`,
+    'X-User-Id': accountInfo.uid,
+    'User-Agent': 'WorkBuddyAI/5.8.4',
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  };
+
+  const results = [];
+
+  // 1. Buddy 旅行：领礼物 & 派出发
+  try {
+    const sRes = await fetch(`${BASE_URL}/v2/activity/growth/buddy/travel/status`, { headers });
+    if (sRes.status === 200) {
+      const sJson = await sRes.json();
+      const state = sJson.data?.state;
+      const dailyLimit = sJson.data?.daily_limit_reached;
+
+      if (state === 'arrived') {
+        const recordId = sJson.data?.record_id;
+        const cRes = await fetch(`${BASE_URL}/v2/activity/growth/buddy/travel/claim`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ record_id: recordId })
+        });
+        if (cRes.status === 200) {
+          const cJson = await cRes.json();
+          const gotCredit = cJson.data?.reward_credit ?? 0;
+          results.push(`领旅行礼物 +${gotCredit} 积分`);
+        }
+      } else if (state === 'traveling') {
+        const locName = sJson.data?.location?.name || '旅途';
+        results.push(`Buddy 旅行中 (${locName})`);
+      }
+
+      if ((state === 'idle' || state === 'arrived') && !dailyLimit) {
+        const cfgRes = await fetch(`${BASE_URL}/v2/activity/growth/buddy/travel/config`, { headers });
+        if (cfgRes.status === 200) {
+          const cfgJson = await cfgRes.json();
+          const locations = cfgJson.data?.locations || [];
+          if (locations.length > 0 && locations[0].id) {
+            const dRes = await fetch(`${BASE_URL}/v2/activity/growth/buddy/travel/depart`, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({ location_id: locations[0].id })
+            });
+            if (dRes.status === 200) {
+              const dJson = await dRes.json();
+              if (dJson.code === 0) {
+                const loc = dJson.data?.location?.name || locations[0].name || '新地点';
+                const dur = dJson.data?.duration_hours || '几';
+                results.push(`派 Buddy 去${loc} (${dur}小时后回)`);
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  // 2. 任务列表扫描与领奖
+  try {
+    const tRes = await fetch(`${BASE_URL}/v2/activity/growth/tasks`, { headers });
+    if (tRes.status === 200) {
+      const tJson = await tRes.json();
+      const tasks = tJson.data?.tasks || [];
+      for (const t of tasks) {
+        if (t.status === 'completed' || t.accept_status === 'completed') {
+          const code = t.code || t.task_code;
+          const claimRes = await fetch(`${BASE_URL}/v2/activity/growth/tasks/${code}/claim`, {
+            method: 'POST',
+            headers,
+            body: '{}'
+          });
+          if (claimRes.status === 200) {
+            const claimJson = await claimRes.json();
+            if (claimJson.code === 0) {
+              results.push(`领任务奖「${t.title || code}」`);
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  // 3. 连登阶梯奖励自动兑换 (7天/14天/28天)
+  try {
+    const rRes = await fetch(`${BASE_URL}/v2/activity/growth/redeem/summary`, { headers });
+    if (rRes.status === 200) {
+      const rJson = await rRes.json();
+      const d = rJson.data || {};
+      const tiers = [
+        { key: 'starter', tier: '7d', label: '7天连登档' },
+        { key: 'advanced', tier: '14d', label: '14天连登档' },
+        { key: 'legendary', tier: '28d', label: '28天连登档' }
+      ];
+
+      for (const t of tiers) {
+        const st = d[t.key + '_status'];
+        if (st && st !== 'locked' && st !== 'claimed') {
+          const cRes = await fetch(`${BASE_URL}/v2/activity/growth/redeem`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ tier: t.tier, client_token: clientToken('u') })
+          });
+          if (cRes.status === 200) {
+            const cJson = await cRes.json();
+            if (cJson.code === 0) {
+              const credit = cJson.data?.credit_granted ?? 0;
+              results.push(`连登兑换成功「${t.label}」+${credit}积分`);
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  // 4. 盲盒抽奖
+  try {
+    const lRes = await fetch(`${BASE_URL}/v2/activity/growth/lottery/chances`, { headers });
+    if (lRes.status === 200) {
+      const lJson = await lRes.json();
+      const chances = lJson.data?.balance || 0;
+      if (chances > 0) {
+        const dRes = await fetch(`${BASE_URL}/v2/activity/growth/lottery/draw`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ client_token: clientToken('u') })
+        });
+        if (dRes.status === 200) {
+          const dJson = await dRes.json();
+          if (dJson.code === 0) {
+            const prize = dJson.data?.prize_name || dJson.data?.prize || '奖励';
+            results.push(`开盲盒获得: ${prize}`);
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  // 5. 断登补签 (持有补登卡且有断签日时触发)
+  try {
+    const strRes = await fetch(`${BASE_URL}/v2/activity/growth/streak`, { headers });
+    if (strRes.status === 200) {
+      const strJson = await strRes.json();
+      const makeupCards = strJson.data?.makeup_cards?.balance || 0;
+      const makeupDates = new Set(strJson.data?.streak?.makeup_dates || []);
+
+      if (makeupCards > 0) {
+        const hmRes = await fetch(`${BASE_URL}/v2/activity/growth/heatmap`, { headers });
+        if (hmRes.status === 200) {
+          const hmJson = await hmRes.json();
+          const cells = hmJson.data?.cells || [];
+          const now = new Date();
+          const currentMonthPrefix = now.toISOString().slice(0, 7);
+          const todayStr = now.toISOString().slice(0, 10);
+
+          const candidates = cells
+            .filter(c => c.date.startsWith(currentMonthPrefix) && c.date < todayStr && c.score === 0 && !makeupDates.has(c.date))
+            .map(c => c.date);
+
+          if (candidates.length > 0) {
+            const targetDate = candidates[candidates.length - 1];
+            const useRes = await fetch(`${BASE_URL}/v2/activity/growth/makeup-cards/use`, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({ target_date: targetDate })
+            });
+            if (useRes.status === 200) {
+              const useJson = await useRes.json();
+              if (useJson.code === 0) {
+                results.push(`自动补登 ${targetDate} (保住连签)`);
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  if (results.length > 0) {
+    log(`  [成长中心] ${results.join(' | ')}`);
+  }
+}
+
 // 自动刷新 Token
 async function refreshTokenIfNeeded(vaultFile, data) {
   const exp = data.auth?.expiresAt;
@@ -408,8 +644,13 @@ async function main() {
       log(`✗ [${acc.nickname}] 对话失败 HTTP ${result.status} (耗时 ${result.duration}ms): ${result.error?.slice(0, 180)}`);
     }
 
+    // 稍作等待并执行签到与成长中心自动化巡检 (自适应兼容国内版与国际版)
+    await new Promise(r => setTimeout(r, 1000));
+    await tryDailyCheckin(acc);
+    await runGrowthCenter(acc);
+
     // 稍作等待并查询最新活跃与积分
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 1500));
     const heatmapScore = await fetchHeatmapScore(acc);
     if (heatmapScore !== null) {
       const statusText = heatmapScore > 0 ? ' (今日活跃已点亮，明日清晨自动发放 +30 奖励包)' : ' (活跃分暂未同步)';
