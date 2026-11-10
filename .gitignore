@@ -20,3 +20,4 @@ Thumbs.db
 # Runtime lock / rotated logs
 .daily-active.lock
 *.log.old
+appeal-11140.txt

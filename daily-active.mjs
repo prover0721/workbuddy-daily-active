@@ -14,6 +14,7 @@ import { readFileSync, writeFileSync, readdirSync, existsSync, appendFileSync, m
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
+import { spawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -41,6 +42,18 @@ const RESTRICT_COOLDOWN_DAYS = 3;
 // --force 参数：忽略“今日已成功”与“冷却期”保护
 const FORCE = process.argv.includes('--force');
 const LOG_MAX_BYTES = 1024 * 1024;
+const STATUS_ONLY = process.argv.includes('--status');      // 只读状态报告，不发对话请求
+const RESUME_DAILY = process.argv.includes('--resume-daily'); // 解除“降级保护模式”，恢复每日频率
+const NO_NOTIFY = process.argv.includes('--no-notify');
+// 常规运行间隔 (天)。被风控限制过的账号自动进入“降级保护模式”，间隔至少 PROTECTED_INTERVAL_DAYS 天
+const INTERVAL_DAYS = Math.max(1, parseInt(process.env.WB_INTERVAL_DAYS || '1', 10) || 1);
+const PROTECTED_INTERVAL_DAYS = 2;
+// 风控冷却：首次 3 天，之后指数退避 (3→6→12→14 封顶)
+const RESTRICT_BASE_DAYS = RESTRICT_COOLDOWN_DAYS;
+const RESTRICT_MAX_DAYS = 14;
+// 非风控类连续失败达到该次数后暂停该账号 24 小时
+const MAX_CONSECUTIVE_FAILURES = 3;
+const APPEAL_FILE = resolve(__dirname, 'appeal-11140.txt');
 
 // 全局请求超时 (20s)，避免网络异常时程序无限挂起
 const _rawFetch = globalThis.fetch;
@@ -55,6 +68,56 @@ const jitter = (min, max) => sleep(min + Math.floor(Math.random() * (max - min))
 function localDateStr(d = new Date()) {
   const p = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 两个本地日期 (YYYY-MM-DD) 相差的天数 */
+function daysBetween(a, b) {
+  return Math.round((new Date(b + 'T00:00:00') - new Date(a + 'T00:00:00')) / 86400000);
+}
+
+/** Windows 桌面气泡通知 (失败静默；--no-notify 可关闭) */
+function notify(title, message) {
+  if (NO_NOTIFY || process.platform !== 'win32') return;
+  try {
+    const clean = t => String(t).replace(/['"`$\r\n]/g, ' ').slice(0, 200);
+    const ps = `Add-Type -AssemblyName System.Windows.Forms,System.Drawing;` +
+      `$n=New-Object System.Windows.Forms.NotifyIcon;$n.Icon=[System.Drawing.SystemIcons]::Warning;$n.Visible=$true;` +
+      `$n.ShowBalloonTip(10000,'${clean(title)}','${clean(message)}',[System.Windows.Forms.ToolTipIcon]::Warning);` +
+      `Start-Sleep -Seconds 8;$n.Dispose()`;
+    spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps],
+      { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  } catch {}
+}
+
+/** 检测官方 WorkBuddy 客户端是否正在运行 (同账号多端并发是风控嫌疑点之一) */
+function detectOfficialClient() {
+  if (process.platform !== 'win32') return [];
+  try {
+    const out = execFileSync('powershell.exe',
+      ['-NoProfile', '-Command', "(Get-Process | Where-Object { $_.ProcessName -match 'workbuddy' } | Select-Object -ExpandProperty ProcessName -Unique) -join ','"],
+      { encoding: 'utf-8', timeout: 8000, windowsHide: true }).trim();
+    return out ? out.split(',') : [];
+  } catch { return []; }
+}
+
+/** 记录申诉材料 (11140)：User ID / RequestId / 时间 / 可直接复制的申诉文案 */
+function writeAppealNote(acc, result) {
+  let requestId = '';
+  try { requestId = JSON.parse(result.error)?.requestId || ''; } catch {}
+  const note = `==== ${new Date().toLocaleString('zh-CN', { hour12: false })} ====
+账号: ${acc.email || acc.nickname}
+User ID: ${acc.uid}
+RequestId: ${requestId}
+错误码: 11140 (HTTP ${result.status})
+
+【申诉文案 - 在官方客户端弹窗点击“提交反馈”后粘贴到最上方】
+客服/运营同学您好：
+我是 WorkBuddy 的正常用户，账号 User ID 为 ${acc.uid}。今天使用时出现 11140 异常拦截 (RequestId: ${requestId})，提示账号被限制使用。
+我并未进行恶意爬取或高频并发调用，请协助人工复核并解除该账号的使用限制，谢谢！
+
+`;
+  try { appendFileSync(APPEAL_FILE, note, 'utf-8'); } catch {}
+  return requestId;
 }
 
 /** 原子写文件：先写临时文件再重命名，防止中途崩溃损坏凭据/状态 */
@@ -692,11 +755,39 @@ async function main() {
   const selectedModel = freeModels[currentModelIdx];
   log(`今日选定轮换模型: [${selectedModel}] (0 积分免费模型)`);
 
+  if (RESUME_DAILY) {
+    for (const h of Object.values(state.accountHistory)) delete h.protectedMode;
+    saveState(state);
+    log('[提示] 已解除所有账号的降级保护模式，恢复每日频率。');
+  }
+
+  // --status：只读状态报告，不发任何对话请求
+  if (STATUS_ONLY) {
+    log('---------------- 账号状态报告 (只读，不发对话) ----------------');
+    for (const acc of accounts) {
+      const h = state.accountHistory[acc.uid] || {};
+      acc.accessToken = acc.raw.auth?.accessToken;
+      const bal = await fetchPreciseBalance(acc);
+      const flags = [];
+      if (h.restrictedUntil && Date.now() < h.restrictedUntil) flags.push(`风控冷却至 ${new Date(h.restrictedUntil).toLocaleString('zh-CN', { hour12: false })}`);
+      if (h.pausedUntil && Date.now() < h.pausedUntil) flags.push('连续失败暂停中');
+      if (h.protectedMode) flags.push(`降级保护模式(每 ${PROTECTED_INTERVAL_DAYS} 天)`);
+      log(`[${acc.nickname}] 积分: ${bal ?? '未知(令牌可能过期)'} | 上次成功: ${h.lastSuccessDate || '无'} | 受限次数: ${h.restrictCount || 0} | ${flags.join('；') || '状态正常'}`);
+    }
+    return;
+  }
+
+  const clients = detectOfficialClient();
+  if (clients.length > 0) {
+    log(`[提醒] 检测到官方客户端正在运行 (${clients.join(', ')})。建议同一账号不要在多个端同时使用，以降低风控概率。`);
+  }
+
   await jitter(1000, 4000);
 
   // 3. 对每个独立账号执行对话与积分查询
   let successCount = 0;
   let skipCount = 0;
+  const alerts = [];
   for (let i = 0; i < accounts.length; i++) {
     const acc = accounts[i];
     const hist = state.accountHistory[acc.uid] = state.accountHistory[acc.uid] || {};
@@ -706,6 +797,19 @@ async function main() {
     // 保护 1：今日已成功，不再重复打扰 (一天多次运行也会被风控视为异常频率)
     if (!FORCE && hist.lastSuccessDate === todayStr) {
       log(`[跳过] 今日已成功完成活跃，无需重复请求。`);
+      skipCount++;
+      continue;
+    }
+    // 保护 1b：运行间隔 (降级保护模式至少 2 天一次)
+    const interval = hist.protectedMode ? Math.max(INTERVAL_DAYS, PROTECTED_INTERVAL_DAYS) : INTERVAL_DAYS;
+    if (!FORCE && hist.lastSuccessDate && daysBetween(hist.lastSuccessDate, todayStr) < interval) {
+      log(`[跳过] 距上次成功不足 ${interval} 天${hist.protectedMode ? ' (降级保护模式，可用 --resume-daily 恢复每日)' : ''}。`);
+      skipCount++;
+      continue;
+    }
+    // 保护 1c：连续失败暂停期
+    if (!FORCE && hist.pausedUntil && Date.now() < hist.pausedUntil) {
+      log(`[跳过] 该账号连续失败已暂停，至 ${new Date(hist.pausedUntil).toLocaleString('zh-CN', { hour12: false })}。请检查网络或重新登录。`);
       skipCount++;
       continue;
     }
@@ -741,19 +845,38 @@ async function main() {
       hist.lastSuccessDate = todayStr;
       hist.consecutiveFailures = 0;
       delete hist.restrictedUntil;
+      delete hist.pausedUntil;
+      if (hist.restrictCount) {
+        hist.protectedMode = true; // 曾被限制过：解封后自动降频，保守运行
+        log(`[${acc.nickname}] 账号已恢复可用！已自动进入降级保护模式 (每 ${PROTECTED_INTERVAL_DAYS} 天一次)，确认稳定后可用 --resume-daily 恢复每日。`);
+        hist.restrictCount = 0;
+      }
     } else if (result.restricted) {
-      hist.restrictedUntil = Date.now() + RESTRICT_COOLDOWN_DAYS * 86400000;
-      hist.consecutiveFailures = (hist.consecutiveFailures || 0) + 1;
-      log(`⚠ [${acc.nickname}] 触发官方风控 11140 (账号对话功能被限制)。已熔断：不再重试，${RESTRICT_COOLDOWN_DAYS} 天内自动跳过该账号。`);
+      hist.restrictCount = (hist.restrictCount || 0) + 1;
+      hist.protectedMode = true;
+      const coolDays = Math.min(RESTRICT_BASE_DAYS * 2 ** (hist.restrictCount - 1), RESTRICT_MAX_DAYS);
+      hist.restrictedUntil = Date.now() + coolDays * 86400000;
+      hist.consecutiveFailures = 0;
+      log(`⚠ [${acc.nickname}] 触发官方风控 11140 (账号对话功能被限制)。已熔断：不再重试，${coolDays} 天内自动跳过该账号 (第 ${hist.restrictCount} 次受限)。`);
       log(`  处理建议：在官方客户端弹窗点击【提交反馈】申诉；资产/积分不受影响；其他账号不受影响。`);
+      const rid = writeAppealNote(acc, result);
+      log(`  已生成申诉材料: ${APPEAL_FILE} (RequestId: ${rid || '无'})`);
+      alerts.push(`${acc.nickname} 触发 11140 风控，已暂停 ${coolDays} 天，申诉材料已生成`);
       saveState(state);
       if (i < accounts.length - 1) await jitter(3000, 6000);
       continue; // 受限账号不再做任何后续探测请求
     } else {
       hist.consecutiveFailures = (hist.consecutiveFailures || 0) + 1;
+      if (hist.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        hist.pausedUntil = Date.now() + 86400000;
+        hist.consecutiveFailures = 0;
+        log(`⚠ [${acc.nickname}] 连续失败 ${MAX_CONSECUTIVE_FAILURES} 次，已暂停该账号 24 小时。`);
+        alerts.push(`${acc.nickname} 连续失败 ${MAX_CONSECUTIVE_FAILURES} 次，已暂停 24 小时`);
+      }
       log(`✗ [${acc.nickname}] 对话失败 HTTP ${result.status} (耗时 ${result.duration}ms): ${String(result.error || '').slice(0, 180)}`);
       if (result.status === 401) {
         log(`  登录凭据已失效，请在 WorkBuddy 客户端重新登录该账号。`);
+        alerts.push(`${acc.nickname} 登录凭据失效，请重新登录`);
       }
     }
 
@@ -795,6 +918,7 @@ async function main() {
   log('----------------------------------------------------');
   log(`每日活跃任务执行完成！成功: ${successCount} / ${accounts.length} (跳过 ${skipCount})。下次轮换模型: ${freeModels[state.modelIndex % freeModels.length]}`);
   log('====================================================\n');
+  if (alerts.length > 0) notify('WorkBuddy 每日活跃 - 需要关注', alerts.join('；'));
 }
 
 main().catch(err => {
