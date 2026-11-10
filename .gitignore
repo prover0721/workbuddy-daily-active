@@ -16,3 +16,7 @@ active-state.json
 Thumbs.db
 .vscode/
 .idea/
+
+# Runtime lock / rotated logs
+.daily-active.lock
+*.log.old
